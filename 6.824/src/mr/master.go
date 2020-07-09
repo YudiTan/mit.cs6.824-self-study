@@ -21,10 +21,14 @@ type Master struct {
 
 // GetTask is an RPC which workers use to request a task to work on.
 func (m *Master) GetTask(req *GetTaskRequest, resp *GetTaskResponse) error {
+	// todo: use actual tasks (i.e. give out reduce tasks when all map tasks are
+	// complete)
+	// todo: need to also sleep when there are not available tasks i.e. in the
+	// case where all map functions need to finish before handing out reduce tasks
 	resp.FileName = m.Files[0]
 	resp.TaskType = 0
 	resp.NReduce = m.NReduce
-	resp.MapTaskNumber = 0
+	resp.TaskNumber = 0
 	return nil
 }
 
