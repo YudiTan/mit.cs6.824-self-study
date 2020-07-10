@@ -10,7 +10,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
-	"sort"
+	"time"
 )
 
 // ByKey is for sorting by key.
@@ -48,8 +48,6 @@ func Worker(mapf func(string, string) []KeyValue,
 	// RPC fails, which most likely means that the master has terminated and
 	// hence there are not more tasks to run.
 	for {
-		// note: this is a blocking call - the master will only respond when it
-		// has a new task
 		task, err := GetTaskFromMaster()
 		if err != nil {
 			// something went wrong with the RPC call, we terminate this worker.
@@ -58,12 +56,17 @@ func Worker(mapf func(string, string) []KeyValue,
 		// now that we have the task, we can start processing it.
 		switch task.TaskType {
 		case 0: // map task
+			log.Printf("Worker: received map task: %v\n", task)
 			ProcessMap(mapf, task)
 		case 1: // reduce task
+			log.Printf("Worker: received reduce task: %v\n", task)
 			ProcessReduce(reducef, task)
 		default: // undefined task
-			log.Fatalf("Worker: Undefined TaskType: %v, exiting worker\n", task.TaskType)
+
 		}
+		// workers sometimes need to wait (i.e. reduces can't start until the
+		// last map finishes)
+		time.Sleep(time.Second * 1)
 	}
 
 }
@@ -91,82 +94,106 @@ func ProcessMap(mapf func(string, string) []KeyValue, task GetTaskResponse) {
 		log.Fatalf("ProcessMap: cannot read %v", task.FileName)
 	}
 	file.Close()
+	filledBuckets := make(map[int]string)
 	intermediateKVs := mapf(task.FileName, string(content))
+	tempFiles := make(map[string]*os.File) // map of real name <-> tmp file
 	// for each intermediate KV, we need to store them in their respective
 	// buckets
 	for _, kv := range intermediateKVs {
 		bucket := ihash(kv.Key) % task.NReduce
+		filledBuckets[bucket] = ""
 		oname := fmt.Sprintf("mr-%v-%v", task.TaskNumber, bucket)
-		// If the file doesn't exist, create it, or append to the file
-		ofile, err := os.OpenFile(oname, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Fatalf("ProcessMap: error creating output file for intermediate KV: %v\n", err)
+		var ofile *os.File
+		// to prevent partially written files, use ioutil.tempfile and
+		// os.rename strategy in the specs.
+		if f, ok := tempFiles[oname]; ok {
+			// a tempfile has already been created for this intermediate file
+			ofile = f
+		} else {
+			// need to create a new tempfile
+			ofile, err = ioutil.TempFile("", oname)
+			if err != nil {
+				log.Fatalf("ProcessMap: error creating temp file for intermediate KV: %v\n", err)
+			}
+			tempFiles[oname] = ofile
 		}
+		// // If the file doesn't exist, create it, or append to the file
+		// ofile, err := os.OpenFile(oname, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		// if err != nil {
+		// 	log.Fatalf("ProcessMap: error creating output file for intermediate KV: %v\n", err)
+		// }
 		enc := json.NewEncoder(ofile)
 		err = enc.Encode(&kv)
 		if err != nil {
 			log.Fatalf("ProcessMap: error writing kv to file: %v\n", err)
 		}
-		err = ofile.Close()
-		if err != nil {
-			log.Fatalf("ProcessMap: error closing file: %v\n", err)
-		}
+		// err = ofile.Close()
+		// if err != nil {
+		// 	log.Fatalf("ProcessMap: error closing file: %v\n", err)
+		// }
 
 	}
-	// TODO: once complete, we need to notify master that we have completed this
-	// map task.
+	// atomically rename all temp files to actual output file names
+	for k, v := range tempFiles {
+		v.Close()
+		os.Rename(v.Name(), k)
+	}
+
+	// now that we have completed the map task, we need to notify the master
+	sigReq := SignalCompleteTaskRequest{
+		TaskType:      0,
+		TaskNumber:    task.TaskNumber,
+		FilledBuckets: filledBuckets,
+	}
+	sigResp := SignalCompleteTaskResponse{}
+	call("Master.SignalCompleteTask", &sigReq, &sigResp)
 }
 
 // ProcessReduce handles applying the reducef to a task
 func ProcessReduce(reducef func(string, []string) string, task GetTaskResponse) {
-	// we first try to read and decode the intermediate KV
-	file, err := os.Open(task.FileName)
-	if err != nil {
-		log.Fatalf("ProcessReduce: cannot open %v", task.FileName)
-	}
-	dec := json.NewDecoder(file)
-	kva := []KeyValue{}
-	for {
-		var kv KeyValue
-		if err := dec.Decode(&kv); err == io.EOF {
-			break // done decoding
-		} else if err != nil {
-			file.Close()
-			log.Fatalf("ProcessReduce: error decoding intermediate KV: %v\n", err)
+	// we try to read all the intermediate files belonging to this task number
+	kvMap := make(map[string][]string)
+	for i := 0; i < task.NMap; i++ {
+		fName := fmt.Sprintf("mr-%v-%v", i, task.TaskNumber)
+		file, err := os.Open(fName)
+		if err != nil {
+			log.Fatalf("ProcessReduce: error opening: %v\n", err)
 		}
-		kva = append(kva, kv)
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err == io.EOF {
+				break // done decoding
+			} else if err != nil {
+				file.Close()
+				log.Fatalf("ProcessReduce: error decoding intermediate KV: %v\n", err)
+			}
+			kvMap[kv.Key] = append(kvMap[kv.Key], kv.Value)
+		}
+		file.Close()
 	}
-	file.Close()
-
-	// sort the intermediate values by key
-	sort.Sort(ByKey(kva))
-
 	oname := fmt.Sprintf("mr-out-%v", task.TaskNumber)
-	ofile, _ := os.Create(oname)
-
-	// call Reduce on each distinct key in intermediate values,
-	// and print the result to output file.
-	i := 0
-	for i < len(kva) {
-		j := i + 1
-		for j < len(kva) && kva[j].Key == kva[i].Key {
-			j++
-		}
-		values := []string{}
-		for k := i; k < j; k++ {
-			values = append(values, kva[k].Value)
-		}
-		output := reducef(kva[i].Key, values)
-
-		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
-
-		i = j
+	ofile, err := ioutil.TempFile("", oname)
+	if err != nil {
+		log.Fatalf("ProcessReduce: Failed to create tmp output file: %v\n", err)
 	}
 
-	ofile.Close()
+	for key, values := range kvMap {
+		red := reducef(key, values)
+		fmt.Fprintf(ofile, "%v %v\n", key, red)
+	}
+	// now that we have written everything to tmp file successfully, we
+	// atomically rename it to actual output name
+	os.Rename(ofile.Name(), oname)
+	defer ofile.Close()
 
-	// TODO: notify master that reduce task has been completed
+	// now that we have completed the reduce task, we need to notify the master
+	sigReq := SignalCompleteTaskRequest{
+		TaskType:   1,
+		TaskNumber: task.TaskNumber,
+	}
+	sigResp := SignalCompleteTaskResponse{}
+	call("Master.SignalCompleteTask", &sigReq, &sigResp)
 
 }
 
@@ -176,9 +203,9 @@ func ProcessReduce(reducef func(string, []string) string, task GetTaskResponse) 
 // returns false if something goes wrong.
 //
 func call(rpcname string, args interface{}, reply interface{}) bool {
-	c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	// sockname := masterSock()
-	// c, err := rpc.DialHTTP("unix", sockname)
+	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+	sockname := masterSock()
+	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}
